@@ -1,5 +1,6 @@
 'use strict';
 
+/** Canonical allowed categories for API filtering (source of truth for tests and routes). */
 const CATEGORIES = ['Food', 'Groceries', 'Housing', 'Utilities', 'Income', 'Transport'];
 
 const TRANSACTIONS = [

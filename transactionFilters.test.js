@@ -5,7 +5,7 @@ const {
   applyTransactionFilters,
   hasActiveFilters,
   FilterValidationError,
-} = require('../src/transactions/transactionFilters');
+} = require('./src/transactions/transactionFilters');
 const { CATEGORIES, TRANSACTIONS } = require('./fixtures');
 
 const run = (query, opts = { allowedCategories: CATEGORIES }) =>

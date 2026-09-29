@@ -2,7 +2,7 @@
 
 const express = require('express');
 const request = require('supertest');
-const { createTransactionsRouter } = require('../src/transactions');
+const { createTransactionsRouter } = require('./src/transactions');
 const { CATEGORIES, TRANSACTIONS } = require('./fixtures');
 
 function buildApp(overrides = {}) {
