@@ -1,12 +1,12 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { startFakeApi, SEED, EMPTY_CATEGORY } from './helpers/fakeApi.js';
+import { startApi, SEED, EMPTY_CATEGORY } from './helpers/server.js';
 
 let api;
 let base;
 before(async () => {
   if (process.env.TEST_API_URL) return void (base = process.env.TEST_API_URL);
-  api = await startFakeApi();
+  api = await startApi();
   base = api.url;
 });
 after(() => api?.close());
@@ -128,7 +128,7 @@ describe('clearing filters', () => {
 
 describe('API / network failure', () => {
   test('server error surfaces as a 5xx the client can detect', async () => {
-    const failing = await startFakeApi({ failWith: 500 });
+    const failing = await startApi({ failing: true });
     try {
       const { status } = await get({ category: 'Food' }, failing.url);
       assert.equal(status, 500);
@@ -137,7 +137,7 @@ describe('API / network failure', () => {
     }
   });
   test('unreachable server rejects the request', async () => {
-    const dead = await startFakeApi();
+    const dead = await startApi();
     const url = dead.url;
     await dead.close();
     await assert.rejects(fetch(`${url}/transactions`));
