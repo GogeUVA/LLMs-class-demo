@@ -1,9 +1,9 @@
-import { getViewState, hasActiveFilters, buildQuery } from './view.js';
+import { createTransactionLoader } from './transactionLoader.js';
+import { getCategories, getTransactions } from './transactionsApi.js';
+import { getViewState } from './view.js';
 
 const $ = (id) => document.getElementById(id);
 const fields = ['search', 'startDate', 'endDate', 'category'];
-let requestId = 0;
-
 const readFilters = () => Object.fromEntries(fields.map((f) => [f, $(f).value]));
 
 function render(state, transactions = []) {
@@ -27,26 +27,11 @@ function render(state, transactions = []) {
   }));
 }
 
-async function load() {
-  const filters = readFilters();
-  const filtersActive = hasActiveFilters(filters);
-  const id = ++requestId;
-  render(getViewState({ loading: true }));
-  try {
-    const res = await fetch(`/transactions${buildQuery(filters)}`);
-    const body = await res.json().catch(() => ({}));
-    if (id !== requestId) return; // a newer request superseded this one
-    if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
-    render(getViewState({ transactions: body.transactions, filtersActive }), body.transactions);
-  } catch (err) {
-    if (id !== requestId) return;
-    render(getViewState({ error: err.message }));
-  }
-}
+const load = createTransactionLoader({ getTransactions, readFilters, render });
 
 async function init() {
   try {
-    const { categories } = await (await fetch('/categories')).json();
+    const categories = await getCategories();
     for (const c of categories) $('category').add(new Option(c, c));
   } catch { /* category list is optional; filtering still works */ }
   for (const f of fields) $(f).addEventListener(f === 'search' ? 'input' : 'change', load);

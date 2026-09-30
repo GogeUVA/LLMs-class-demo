@@ -1,3 +1,5 @@
+import { buildTransactionQuery } from './transactionsApi.js';
+
 // Pure helpers deciding what the history list shows.
 export function getViewState({ loading, error, transactions, filtersActive }) {
   if (loading) return { kind: 'loading', message: 'Loading transactions…' };
@@ -16,8 +18,5 @@ export function hasActiveFilters(f) {
 }
 
 export function buildQuery(f) {
-  const p = new URLSearchParams();
-  for (const [k, v] of Object.entries(f)) if (v && String(v).trim()) p.set(k, String(v).trim());
-  const s = p.toString();
-  return s ? `?${s}` : '';
+  return buildTransactionQuery(f);
 }
