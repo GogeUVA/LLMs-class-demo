@@ -106,4 +106,3 @@ test('loader requests all transactions after filters are cleared', async () => {
 
   assert.deepEqual(requestedFilters[1], filters);
 });
-

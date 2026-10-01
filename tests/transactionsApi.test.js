@@ -78,4 +78,3 @@ test('getCategories returns categories from the API', async () => {
 
   assert.deepEqual(categories, ['Food', 'Travel']);
 });
-

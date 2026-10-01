@@ -28,4 +28,3 @@ export async function getCategories({ fetchImpl = fetch } = {}) {
   if (!response.ok) throw new Error(body.error ?? `HTTP ${response.status}`);
   return Array.isArray(body.categories) ? body.categories : [];
 }
-

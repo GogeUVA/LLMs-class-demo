@@ -24,4 +24,3 @@ export function createTransactionLoader({ getTransactions, readFilters, render }
     }
   };
 }
-
