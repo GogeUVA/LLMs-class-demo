@@ -1,234 +1,287 @@
-const transactions = [
-  { id: 1, description: "Chipotle", date: "2026-09-20", category: "Food" },
-  { id: 2, description: "Uber", date: "2026-09-21", category: "Transportation" },
-  { id: 3, description: "Target", date: "2026-09-25", category: "Shopping" },
-  { id: 4, description: "Spotify", date: "2026-09-27", category: "Entertainment" }
-];
+'use strict';
 
-const filters = {
-  search: "",
-  startDate: "",
-  endDate: "",
-  category: ""
-};
+/**
+ * Transaction filtering logic for GET /transactions.
+ *
+ * This module has no framework or database dependency, so it can be reused
+ * by any route, service, or test. It does two things:
+ *   1. parseTransactionFilters(query)   -> validates raw query params
+ *   2. applyTransactionFilters(list, f) -> returns only matching transactions
+ *
+ * Supported query params: search, startDate, endDate, category.
+ * All active filters are combined with AND. Missing or empty params are ignored,
+ * so requests without filters behave exactly as before.
+ */
 
-// Elements
-const searchInput = document.getElementById("transaction-search");
-const startDateInput = document.getElementById("start-date");
-const endDateInput = document.getElementById("end-date");
-const categorySelect = document.getElementById("category-filter");
-const clearButton = document.getElementById("clear-filters");
-const activeFilters = document.getElementById("active-filters");
-const errorMessage = document.getElementById("filter-error");
-const transactionList = document.getElementById("transaction-list");
+const MAX_SEARCH_LENGTH = 100;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
 
-// Populate category dropdown
-function populateCategories() {
-  const categories = [
-    ...new Set(
-      transactions
-        .map(transaction => transaction.category)
-        .filter(Boolean)
-    )
-  ].sort();
+const DEFAULT_SEARCH_FIELDS = ['description', 'merchant', 'notes', 'category'];
+const DEFAULT_GET_DATE = (txn) => txn.date;
+const DEFAULT_GET_CATEGORY = (txn) => txn.category;
 
-  categories.forEach(category => {
-    const option = document.createElement("option");
-    option.value = category;
-    option.textContent = category;
-    categorySelect.appendChild(option);
-  });
+class FilterValidationError extends Error {
+  /** @param {{ param: string, message: string }[]} details */
+  constructor(details) {
+    super('Invalid query parameters');
+    this.name = 'FilterValidationError';
+    this.status = 400;
+    this.details = details;
+  }
+}
 
-  // Edge case: no categories available
-  if (categories.length === 0) {
-    categorySelect.disabled = true;
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
 
-    if (categorySelect.options.length > 0) {
-      categorySelect.options[0].textContent = "No categories available";
+/** Lowercase, Unicode-normalize, and collapse all whitespace runs to one space. */
+function normalizeText(value) {
+  return String(value)
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Reads a single string param. Returns undefined when missing, empty, or
+ * whitespace only. Records an error for repeated params (?a=1&a=2) or nested
+ * objects (?a[b]=1), which some query parsers produce.
+ */
+function readParam(query, name, errors) {
+  const raw = query == null ? undefined : query[name];
+  if (raw === undefined || raw === null) return undefined;
+
+  if (Array.isArray(raw)) {
+    errors.push({ param: name, message: `"${name}" must be provided only once.` });
+    return undefined;
+  }
+  if (typeof raw !== 'string') {
+    errors.push({ param: name, message: `"${name}" must be a plain string value.` });
+    return undefined;
+  }
+
+  const trimmed = raw.trim();
+  return trimmed === '' ? undefined : trimmed;
+}
+
+/** Validates a YYYY-MM-DD string as a real calendar date. Returns UTC ms or null. */
+function parseDateOnly(value) {
+  const match = DATE_ONLY_RE.exec(value);
+  if (!match) return null;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const ts = Date.UTC(year, month - 1, day);
+  const check = new Date(ts);
+
+  // Rejects rollovers like 2026-02-30 (which Date would turn into March 2).
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return ts;
+}
+
+/**
+ * Parses a query date. Accepts YYYY-MM-DD (treated as a UTC calendar day) or a
+ * full ISO 8601 datetime with timezone. For date-only end dates, the whole day
+ * is included (up to 23:59:59.999 UTC). Returns ms timestamp or null if invalid.
+ */
+function parseQueryDate(value, { endOfDay = false } = {}) {
+  const dateOnly = parseDateOnly(value);
+  if (dateOnly !== null) return endOfDay ? dateOnly + DAY_MS - 1 : dateOnly;
+
+  if (ISO_DATETIME_RE.test(value) && parseDateOnly(value.slice(0, 10)) !== null) {
+    const ts = Date.parse(value);
+    return Number.isNaN(ts) ? null : ts;
+  }
+  return null;
+}
+
+/** Converts a stored transaction date (string, Date, or ms number) to ms, or null. */
+function toTimestamp(value) {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.getTime();
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string') {
+    const dateOnly = parseDateOnly(value.trim());
+    if (dateOnly !== null) return dateOnly;
+    const ts = Date.parse(value);
+    return Number.isNaN(ts) ? null : ts;
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Public API                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Validates raw query params and returns a normalized filter object.
+ * Throws FilterValidationError (status 400) listing every problem found.
+ *
+ * @param {object} query  e.g. req.query
+ * @param {object} [options]
+ * @param {string[]} [options.allowedCategories] If given, unknown categories are
+ *        rejected with a 400. If omitted, any category is accepted and an
+ *        unknown one simply yields zero results.
+ * @param {number} [options.maxSearchLength=100]
+ * @returns {{ search?: string, searchTerms?: string[], startDate?: number,
+ *             endDate?: number, category?: string }}
+ */
+function parseTransactionFilters(query, options = {}) {
+  const { allowedCategories, maxSearchLength = MAX_SEARCH_LENGTH } = options;
+  const errors = [];
+  const filters = {};
+
+  // search
+  const search = readParam(query, 'search', errors);
+  if (search !== undefined) {
+    const normalized = normalizeText(search);
+    if (normalized.length > maxSearchLength) {
+      errors.push({
+        param: 'search',
+        message: `"search" must be at most ${maxSearchLength} characters.`,
+      });
+    } else if (normalized !== '') {
+      filters.search = normalized;
+      filters.searchTerms = normalized.split(' ');
     }
   }
-}
 
-// Validate filter inputs
-function validateFilters() {
-  errorMessage.textContent = "";
+  // startDate / endDate
+  const startRaw = readParam(query, 'startDate', errors);
+  if (startRaw !== undefined) {
+    const ts = parseQueryDate(startRaw);
+    if (ts === null) {
+      errors.push({
+        param: 'startDate',
+        message: '"startDate" must be a valid date in YYYY-MM-DD (or ISO 8601) format.',
+      });
+    } else {
+      filters.startDate = ts;
+    }
+  }
+
+  const endRaw = readParam(query, 'endDate', errors);
+  if (endRaw !== undefined) {
+    const ts = parseQueryDate(endRaw, { endOfDay: true });
+    if (ts === null) {
+      errors.push({
+        param: 'endDate',
+        message: '"endDate" must be a valid date in YYYY-MM-DD (or ISO 8601) format.',
+      });
+    } else {
+      filters.endDate = ts;
+    }
+  }
 
   if (
-    filters.startDate &&
-    filters.endDate &&
+    filters.startDate !== undefined &&
+    filters.endDate !== undefined &&
     filters.startDate > filters.endDate
   ) {
-    errorMessage.textContent =
-      "Start date cannot be later than end date.";
-
-    return false;
+    errors.push({ param: 'endDate', message: '"endDate" must be on or after "startDate".' });
   }
 
-  return true;
+  // category
+  const categoryRaw = readParam(query, 'category', errors);
+  if (categoryRaw !== undefined) {
+    const wanted = normalizeText(categoryRaw);
+    if (Array.isArray(allowedCategories)) {
+      const canonical = allowedCategories.find((c) => normalizeText(c) === wanted);
+      if (canonical === undefined) {
+        errors.push({
+          param: 'category',
+          message: `Unknown category "${categoryRaw}". Allowed: ${allowedCategories.join(', ')}.`,
+        });
+      } else {
+        filters.category = normalizeText(canonical);
+      }
+    } else {
+      filters.category = wanted;
+    }
+  }
+
+  if (errors.length > 0) throw new FilterValidationError(errors);
+  return filters;
 }
 
-// Issue #1 uses local filtering only.
-// A later issue can replace this with an API request.
-function filterTransactions() {
-  renderActiveFilters();
+/** True if at least one filter is active. */
+function hasActiveFilters(filters) {
+  return Boolean(
+    filters &&
+      (filters.searchTerms ||
+        filters.category !== undefined ||
+        filters.startDate !== undefined ||
+        filters.endDate !== undefined)
+  );
+}
 
-  if (!validateFilters()) {
-    renderInvalidDateState();
-    return;
-  }
+/**
+ * Returns the transactions that match ALL active filters, preserving the
+ * original order. With no active filters, returns the input unchanged.
+ *
+ * @param {object[]} transactions
+ * @param {object} filters  output of parseTransactionFilters
+ * @param {object} [options]
+ * @param {string[]} [options.searchFields] fields to search (default: description, merchant, notes, category)
+ * @param {(txn: object) => any} [options.getDate] reads a transaction's date (default: txn.date)
+ * @param {(txn: object) => any} [options.getCategory] reads a transaction's category (default: txn.category)
+ */
+function applyTransactionFilters(transactions, filters, options = {}) {
+  const list = Array.isArray(transactions) ? transactions : [];
+  if (!hasActiveFilters(filters)) return list;
 
-  const filtered = transactions.filter(transaction => {
-    const matchesSearch =
-      !filters.search ||
-      transaction.description
-        .toLowerCase()
-        .includes(filters.search.toLowerCase());
+  const searchFields = options.searchFields || DEFAULT_SEARCH_FIELDS;
+  const getDate = options.getDate || DEFAULT_GET_DATE;
+  const getCategory = options.getCategory || DEFAULT_GET_CATEGORY;
+  const { searchTerms, category, startDate, endDate } = filters;
+  const hasDateFilter = startDate !== undefined || endDate !== undefined;
 
-    const matchesStartDate =
-      !filters.startDate ||
-      transaction.date >= filters.startDate;
+  return list.filter((txn) => {
+    if (!txn || typeof txn !== 'object') return false;
 
-    const matchesEndDate =
-      !filters.endDate ||
-      transaction.date <= filters.endDate;
+    if (category !== undefined) {
+      const txnCategory = getCategory(txn);
+      if (txnCategory == null || normalizeText(txnCategory) !== category) return false;
+    }
 
-    const matchesCategory =
-      !filters.category ||
-      transaction.category === filters.category;
+    if (hasDateFilter) {
+      const ts = toTimestamp(getDate(txn));
+      if (ts === null) return false; // undated rows cannot satisfy a date filter
+      if (startDate !== undefined && ts < startDate) return false;
+      if (endDate !== undefined && ts > endDate) return false;
+    }
 
-    return (
-      matchesSearch &&
-      matchesStartDate &&
-      matchesEndDate &&
-      matchesCategory
-    );
+    if (searchTerms) {
+      // Plain substring matching, never regex, so input like ".*" or "(" is safe.
+      // Every term must appear somewhere across the searchable fields.
+      const haystack = normalizeText(
+        searchFields
+          .map((field) => txn[field])
+          .filter((v) => v !== undefined && v !== null)
+          .join(' ')
+      );
+      if (!searchTerms.every((term) => haystack.includes(term))) return false;
+    }
+
+    return true;
   });
-
-  renderTransactions(filtered);
 }
 
-// Render transaction history
-function renderTransactions(items) {
-  transactionList.innerHTML = "";
-
-  // Edge case: filters return zero transactions
-  if (items.length === 0) {
-    const noResults = document.createElement("div");
-    noResults.className = "no-results";
-
-    const message = document.createElement("p");
-    message.textContent = "No matching transactions.";
-
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = "Clear filters";
-    button.addEventListener("click", clearFilters);
-
-    noResults.append(message, button);
-    transactionList.appendChild(noResults);
-
-    return;
-  }
-
-  items.forEach(transaction => {
-    const item = document.createElement("div");
-    item.className = "transaction";
-
-    const description = document.createElement("strong");
-    description.textContent = transaction.description;
-
-    const date = document.createElement("span");
-    date.textContent = transaction.date;
-
-    const category = document.createElement("span");
-    category.textContent = transaction.category;
-
-    item.append(description, date, category);
-    transactionList.appendChild(item);
-  });
-}
-
-// Display a clear state when the date range is invalid
-function renderInvalidDateState() {
-  transactionList.innerHTML = "";
-
-  const invalidState = document.createElement("div");
-  invalidState.className = "no-results";
-
-  const message = document.createElement("p");
-  message.textContent = "Please correct the invalid date range.";
-
-  invalidState.appendChild(message);
-  transactionList.appendChild(invalidState);
-}
-
-// Show user which filters are currently active
-function renderActiveFilters() {
-  const labels = [];
-
-  if (filters.search) {
-    labels.push(`Search: "${filters.search}"`);
-  }
-
-  if (filters.startDate) {
-    labels.push(`From: ${filters.startDate}`);
-  }
-
-  if (filters.endDate) {
-    labels.push(`To: ${filters.endDate}`);
-  }
-
-  if (filters.category) {
-    labels.push(`Category: ${filters.category}`);
-  }
-
-  activeFilters.textContent = labels.length
-    ? `Active filters: ${labels.join(" | ")}`
-    : "No active filters";
-
-  clearButton.disabled = labels.length === 0;
-}
-
-// Clear all filters
-function clearFilters() {
-  filters.search = "";
-  filters.startDate = "";
-  filters.endDate = "";
-  filters.category = "";
-
-  searchInput.value = "";
-  startDateInput.value = "";
-  endDateInput.value = "";
-  categorySelect.value = "";
-
-  errorMessage.textContent = "";
-
-  filterTransactions();
-}
-
-// Event listeners
-searchInput.addEventListener("input", event => {
-  filters.search = event.target.value.trim();
-  filterTransactions();
-});
-
-startDateInput.addEventListener("change", event => {
-  filters.startDate = event.target.value;
-  filterTransactions();
-});
-
-endDateInput.addEventListener("change", event => {
-  filters.endDate = event.target.value;
-  filterTransactions();
-});
-
-categorySelect.addEventListener("change", event => {
-  filters.category = event.target.value;
-  filterTransactions();
-});
-
-clearButton.addEventListener("click", clearFilters);
-
-// Initialize
-populateCategories();
-filterTransactions();
+module.exports = {
+  parseTransactionFilters,
+  applyTransactionFilters,
+  hasActiveFilters,
+  FilterValidationError,
+  normalizeText,
+  DEFAULT_SEARCH_FIELDS,
+  MAX_SEARCH_LENGTH,
+};
